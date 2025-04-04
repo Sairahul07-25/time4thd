@@ -1,8 +1,12 @@
+import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:table_calendar/table_calendar.dart';
 import 'package:flutter_sound/flutter_sound.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:uuid/uuid.dart';
 
 void main() {
   runApp(const MyApp());
@@ -20,7 +24,6 @@ class MyApp extends StatelessWidget {
   }
 }
 
-// 📅 Calendar Screen
 class CalendarScreen extends StatefulWidget {
   const CalendarScreen({super.key});
 
@@ -64,7 +67,6 @@ class CalendarScreenState extends State<CalendarScreen> {
   }
 }
 
-// 📝 Note Page (Text + Voice Notes)
 class NotePage extends StatefulWidget {
   final DateTime date;
   const NotePage({super.key, required this.date});
@@ -76,122 +78,193 @@ class NotePage extends StatefulWidget {
 class NotePageState extends State<NotePage> {
   final TextEditingController _controller = TextEditingController();
   FlutterSoundRecorder? _recorder;
+  FlutterSoundPlayer? _player;
   bool _isRecording = false;
-  String? _filePath;
-  String? _savedTextNote;
-  String? _savedVoicePath;
+  bool _isPlaying = false;
+  List<Map<String, String>> _voiceNotes = [];
+  final uuid = const Uuid();
 
   @override
   void initState() {
     super.initState();
     _recorder = FlutterSoundRecorder();
-    _initRecorder();
-    _loadNote();
+    _player = FlutterSoundPlayer();
+    _init();
   }
 
-  // 📌 Initialize Recorder
-  Future<void> _initRecorder() async {
+  Future<void> _init() async {
     await _recorder!.openRecorder();
+    await _player!.openPlayer();
+    await _loadNotes();
   }
 
-  // 🔹 Load Saved Notes from SharedPreferences
-  Future<void> _loadNote() async {
+  Future<void> _loadNotes() async {
     SharedPreferences prefs = await SharedPreferences.getInstance();
-    setState(() {
-      _savedTextNote = prefs.getString(_getTextKey());
-      _savedVoicePath = prefs.getString(_getVoiceKey());
-      if (_savedTextNote != null) {
-        _controller.text = _savedTextNote!;
-      }
-    });
+    _controller.text = prefs.getString(_getTextKey()) ?? '';
+    final voiceJson = prefs.getString(_getVoiceKey());
+    if (voiceJson != null) {
+      _voiceNotes = List<Map<String, String>>.from(json.decode(voiceJson));
+    }
+    if (mounted) setState(() {});
   }
 
-  // 🔹 Save Text Note to SharedPreferences
-  Future<void> _saveNote() async {
+  Future<void> _saveTextNote() async {
     SharedPreferences prefs = await SharedPreferences.getInstance();
     await prefs.setString(_getTextKey(), _controller.text);
   }
 
-  // 🎤 Start Voice Recording
-  Future<void> _startRecording() async {
-    final directory = await getApplicationDocumentsDirectory();
-    if (!mounted) return;
-
-    _filePath = "${directory.path}/note_${widget.date.toIso8601String()}.aac";
-
-    await _recorder!.startRecorder(
-      toFile: _filePath,
-      codec: Codec.aacADTS,
-    );
-
-    if (!mounted) return;
-    setState(() {
-      _isRecording = true;
-    });
-  }
-
-  // 🎤 Stop Voice Recording & Save File Path
-  Future<void> _stopRecording() async {
-    await _recorder!.stopRecorder();
-    if (!mounted) return; // ✅ Ensure widget is still in the tree
-
+  Future<void> _saveVoiceNotes() async {
     SharedPreferences prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_getVoiceKey(), _filePath!);
+    await prefs.setString(_getVoiceKey(), json.encode(_voiceNotes));
+  }
 
-    setState(() {
-      _isRecording = false;
-      _savedVoicePath = _filePath;
-    });
+  Future<void> _startRecording() async {
+    var status = await Permission.microphone.request();
+    if (!status.isGranted) return;
 
-    if (!mounted) return; // ✅ Check again before using context
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text("Voice note saved: $_filePath")),
+    final dir = await getApplicationDocumentsDirectory();
+    final id = uuid.v4();
+    final path = '${dir.path}/note_${widget.date.toIso8601String()}_$id.aac';
+
+    await _recorder!.startRecorder(toFile: path, codec: Codec.aacADTS);
+    setState(() => _isRecording = true);
+  }
+
+  Future<void> _stopRecording() async {
+    final path = await _recorder!.stopRecorder();
+    final name = 'Recording ${_voiceNotes.length + 1}';
+
+    _voiceNotes.add({"path": path!, "name": name});
+    await _saveVoiceNotes();
+
+    setState(() => _isRecording = false);
+  }
+
+  Future<void> _play(String path) async {
+    if (!File(path).existsSync()) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Voice file not found.")),
+      );
+      return;
+    }
+
+    try {
+      await _player!.startPlayer(
+        fromURI: path,
+        codec: Codec.aacADTS,
+        whenFinished: () {
+          if (mounted) {
+            setState(() => _isPlaying = false);
+          }
+        },
+      );
+      if (mounted) setState(() => _isPlaying = true);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Playback failed: $e")),
+        );
+      }
+    }
+  }
+
+
+
+  Future<void> _stop() async {
+    await _player!.stopPlayer();
+    setState(() => _isPlaying = false);
+  }
+
+  String _getTextKey() => "note_${widget.date.toIso8601String()}";
+  String _getVoiceKey() => "voice_${widget.date.toIso8601String()}";
+
+  void _renameDialog(int index) {
+    final renameController = TextEditingController(text: _voiceNotes[index]['name']);
+
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Rename Recording'),
+        content: TextField(controller: renameController),
+        actions: [
+          TextButton(
+            child: const Text("Cancel"),
+            onPressed: () => Navigator.pop(context),
+          ),
+          TextButton(
+            child: const Text("Rename"),
+            onPressed: () async {
+              setState(() {
+                _voiceNotes[index]['name'] = renameController.text;
+              });
+              await _saveVoiceNotes();
+              if (mounted) Navigator.pop(context);
+            },
+          )
+        ],
+      ),
     );
-  }
-
-  // 📌 Helper function to get the storage key for text notes
-  String _getTextKey() {
-    return "note_${widget.date.toIso8601String()}";
-  }
-
-  // 📌 Helper function to get the storage key for voice recordings
-  String _getVoiceKey() {
-    return "voice_${widget.date.toIso8601String()}";
   }
 
   @override
   void dispose() {
     _recorder!.closeRecorder();
-    _saveNote();
+    _player!.closePlayer();
+    _saveTextNote();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final dateStr = widget.date.toLocal().toString().split(' ')[0];
+
     return Scaffold(
-      appBar: AppBar(title: Text("Notes for ${widget.date.toLocal()}".split(' ')[0])),
+      appBar: AppBar(title: Text("Notes for $dateStr")),
       body: Padding(
         padding: const EdgeInsets.all(16.0),
         child: Column(
           children: [
             TextField(
               controller: _controller,
-              maxLines: 8,
+              maxLines: 4,
               decoration: const InputDecoration(hintText: "Write your note here"),
-              onChanged: (text) => _saveNote(), // Save on text change
+              onChanged: (_) => _saveTextNote(),
             ),
-            const SizedBox(height: 20),
+            const SizedBox(height: 16),
             ElevatedButton.icon(
               onPressed: _isRecording ? _stopRecording : _startRecording,
-              icon: Icon(_isRecording ? Icons.mic_off : Icons.mic),
+              icon: Icon(_isRecording ? Icons.stop : Icons.mic),
               label: Text(_isRecording ? "Stop Recording" : "Start Voice Recording"),
             ),
-            const SizedBox(height: 20),
-            if (_savedVoicePath != null)
-              Text(
-                "Voice note saved!",
-                style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.green),
+            const SizedBox(height: 16),
+            Expanded(
+              child: ListView.builder(
+                itemCount: _voiceNotes.length,
+                itemBuilder: (context, index) {
+                  final voice = _voiceNotes[index];
+                  return Card(
+                    child: ListTile(
+                      leading: const Icon(Icons.voice_chat),
+                      title: Text(voice['name'] ?? 'Voice Note'),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            icon: Icon(_isPlaying ? Icons.pause : Icons.play_arrow),
+                            onPressed: _isPlaying ? _stop : () => _play(voice['path']!),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.edit),
+                            onPressed: () => _renameDialog(index),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
               ),
+            )
           ],
         ),
       ),

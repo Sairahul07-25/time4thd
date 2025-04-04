@@ -30,11 +30,12 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  flutter_sound: ^9.2.13  # For recording voice
+  flutter_sound: ^9.2.13+1  # For recording voice
   table_calendar: ^3.0.9
   permission_handler: ^11.0.0  # To request microphone permission
   path_provider: ^2.1.1 # To save the audio file
   shared_preferences: ^2.2.2
+  uuid: ^4.0.0  # 👈 Add this line
 
 dev_dependencies:
   flutter_test:
